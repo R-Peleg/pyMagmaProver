@@ -1,0 +1,5 @@
+data/
+*.pyc
+proofs/*.lean
+pymagmaprover.egg-info/
+proofs/.lake/config/\[anonymous]/lakefile.olean
