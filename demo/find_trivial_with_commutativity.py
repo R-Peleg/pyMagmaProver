@@ -190,10 +190,11 @@ def main() -> tuple[dict[str, Any], dict[str, str], dict[str, str], list[str], l
                 reason[eq_id] = 'test_proof'
                 pbar.update(1)
                 for pred in nx.ancestors(G, eq_id):
-                    if status[pred] == 'not_tried':
+                    if status[pred] in ('UNKNOWN', 'not_tried'):
                         status[pred] = True
                         reason[pred] = 'propagate_true'
-                        pbar.update(1)
+                        if status[pred] == 'not_tried':
+                            pbar.update(1)
             else:
                 status[eq_id] = 'UNKNOWN'
                 reason[eq_id] = 'unknown'
