@@ -20,11 +20,12 @@ import requests
 from tqdm import tqdm
 
 from eq3.equation_utils import parse_equation
-from eq3.symbolic import TakeSided, BinaryOpSolver, FalseOpSolver
+from eq3.symbolic import TakeSided, BinaryOpSolver, FalseOpSolver, AffineModSolver
 from eq3.equation_path import EquationPathSolver
 from eq3.composite_solver import CompositeSolver
+from eq3.llm_based_solver import LLMBasedSolver
 from eq3.lean_utils import (
-    spec_to_code, solution_to_code, check_solution_with_lean,
+    solution_to_code, check_solution_with_lean,
     eq3_lean_spec, PREFIX
 )
 
@@ -35,10 +36,19 @@ EQUATIONS_URL = 'https://raw.githubusercontent.com/teorth/equational_theories/re
 LOCAL_EQUATIONS_FILE = 'equations.txt'
 RUN_LEAN = False
 
-main_solver = CompositeSolver([
-    TakeSided, BinaryOpSolver, FalseOpSolver, EquationPathSolver(max_degree=4)])
+classic_solver = CompositeSolver([
+    TakeSided,
+    BinaryOpSolver,
+    FalseOpSolver,
+    AffineModSolver(3),
+    AffineModSolver(4),
+    AffineModSolver(5),
+    EquationPathSolver(max_degree=4),
+])
 
 PROOFS_DIR = "proofs"
+LLM_PROOFS_DIR = os.path.join(PROOFS_DIR, "llm")
+LLM_FAILED_DIR = os.path.join(PROOFS_DIR, "llm_failed")
 
 
 def download_if_needed() -> None:
@@ -74,9 +84,9 @@ def eq_number(eq_id: str) -> int:
 
 def trivial_commutativity_spec(eq_id: str, eq_str: str) -> dict[str, Any]:
     """Create a spec dict for the problem: equation + commutativity -> singleton."""
-    eq_obj = parse_equation(eq_str)
-    comm_obj = parse_equation('x ◇ y = y ◇ x')
-    singleton = parse_equation('x = y')
+    eq_obj = parse_equation(eq_str, 'hX')
+    comm_obj = parse_equation('x ◇ y = y ◇ x', 'hY')
+    singleton = parse_equation('x = y', 'target')
     entry = {
         'X': eq_id,
         'X_str': eq_str,
@@ -140,7 +150,45 @@ def main() -> tuple[dict[str, Any], dict[str, str], dict[str, str], list[str], l
         return parsed[eq_id]
 
     os.makedirs(PROOFS_DIR, exist_ok=True)
-    with tqdm(total=len(G.nodes), desc="Testing equations") as pbar:
+
+    def write_solution(eq_id: str, spec: dict[str, Any], solution: dict[str, Any], source: str, proof_key: str) -> None:
+        lean_code = solution_to_code({**spec, proof_key: solution[proof_key]})
+        if RUN_LEAN:
+            ok, lean_output = check_solution_with_lean(lean_code, workdir=PROOFS_DIR)
+        else:
+            ok, lean_output = True, ''
+        if not ok:
+            raise RuntimeError(f"Lean verification failed for {eq_id}:\n{lean_output}")
+        with open(os.path.join(PROOFS_DIR, f"{eq_id}_{source}.lean"), 'w') as f:
+            f.write(lean_code)
+
+    def apply_solution(eq_id: str, spec: dict[str, Any], solution: dict[str, Any], source: str) -> bool:
+        if 'vc-proof-negative' in solution:
+            write_solution(eq_id, spec, solution, source, 'vc-proof-negative')
+            status[eq_id] = False
+            cex_label = solution.get('counterexample', source)
+            counterexample[eq_id] = cex_label
+            reason[eq_id] = f'{source}_counterexample'
+            for succ in nx.descendants(G, eq_id):
+                if status[succ] in ('UNKNOWN', 'not_tried'):
+                    status[succ] = False
+                    counterexample[succ] = cex_label
+                    reason[succ] = 'propagate_false'
+            return True
+
+        if 'vc-proof-positive' in solution:
+            write_solution(eq_id, spec, solution, source, 'vc-proof-positive')
+            status[eq_id] = True
+            reason[eq_id] = f'{source}_proof'
+            for pred in nx.ancestors(G, eq_id):
+                if status[pred] in ('UNKNOWN', 'not_tried'):
+                    status[pred] = True
+                    reason[pred] = 'propagate_true'
+            return True
+
+        return False
+
+    with tqdm(desc="Classic solver", unit="eq") as pbar:
         while True:
             not_tried = [n for n in G.nodes if status[n] == 'not_tried']
             if not not_tried:
@@ -152,54 +200,45 @@ def main() -> tuple[dict[str, Any], dict[str, str], dict[str, str], list[str], l
 
             parsable.sort(key=eq_number)
             eq_id = parsable[0]
-
             spec = trivial_commutativity_spec(eq_id, eq_string(eq_id))
-            solution = main_solver.try_solve(spec, return_all=False)
-            if solution is None:
+            solution = classic_solver.try_solve(spec, return_all=False)
+            if solution is None or not apply_solution(eq_id, spec, solution, 'classic'):
                 status[eq_id] = 'UNKNOWN'
                 reason[eq_id] = 'unknown'
-                pbar.update(1)
-                continue
-
-            if 'vc-proof-negative' in solution:
-                status[eq_id] = False
-                cex_label = solution['counterexample']
-                counterexample[eq_id] = cex_label
-                reason[eq_id] = 'test_counterexample'
-                for succ in nx.descendants(G, eq_id):
-                    if status[succ] == 'not_tried':
-                        status[succ] = False
-                        counterexample[succ] = cex_label
-                        reason[succ] = 'propagate_false'
-                        pbar.update(1)
-            elif 'vc-proof-positive' in solution:
-                solution_full_dict = {
-                    **spec,
-                    "vc-proof-positive": solution['vc-proof-positive']
-                }
-                lean_code = solution_to_code(solution_full_dict)
-                if RUN_LEAN:
-                    ok, lean_output = check_solution_with_lean(lean_code, workdir=PROOFS_DIR)
-                else:
-                    ok, lean_output = True, ''
-                if not ok:
-                    raise RuntimeError(f"Lean verification failed for {eq_id}:\n{lean_output}")
-                with open(os.path.join(PROOFS_DIR, f"{eq_id}.lean"), 'w') as f:
-                    f.write(lean_code)
-                status[eq_id] = True
-                reason[eq_id] = 'test_proof'
-                pbar.update(1)
-                for pred in nx.ancestors(G, eq_id):
-                    if status[pred] in ('UNKNOWN', 'not_tried'):
-                        status[pred] = True
-                        reason[pred] = 'propagate_true'
-                        if status[pred] == 'not_tried':
-                            pbar.update(1)
-            else:
-                status[eq_id] = 'UNKNOWN'
-                reason[eq_id] = 'unknown'
-
             pbar.update(1)
+
+    llm_solver = LLMBasedSolver(
+        proofs_dir=LLM_PROOFS_DIR + '_gemini_prop',
+        failed_dir=LLM_FAILED_DIR + '_gemini_prop',
+        lean_workdir=PROOFS_DIR,
+        model='google/gemini-3.1-pro-preview'
+    )
+    llm_attempts = 0
+    llm_positive = 0
+    llm_negative = 0
+    if llm_solver.api_key:
+        llm_candidates = sorted(
+            [n for n in G.nodes if status[n] == 'UNKNOWN' and get_parsed(n) is not None],
+            key=eq_number,
+        )
+        with tqdm(llm_candidates, desc="LLM solver", unit="eq") as pbar:
+            for eq_id in pbar:
+                if status[eq_id] != 'UNKNOWN':
+                    continue
+                spec = trivial_commutativity_spec(eq_id, eq_string(eq_id))
+                llm_attempts += 1
+                solution = llm_solver.try_solve(spec, return_all=False)
+                if llm_attempts >= 3:
+                    break
+                if solution is None:
+                    continue
+                if apply_solution(eq_id, spec, solution, 'llm'):
+                    if 'vc-proof-positive' in solution:
+                        llm_positive += 1
+                    elif 'vc-proof-negative' in solution:
+                        llm_negative += 1
+    else:
+        print("OPENROUTER_API_KEY not found; skipping LLM solver phase.")
 
     # Anything still not_tried is unparseable
     for n in G.nodes:
@@ -210,9 +249,13 @@ def main() -> tuple[dict[str, Any], dict[str, str], dict[str, str], list[str], l
     t_elapsed = time.time() - t_start
 
     # Collect statistics by reason
-    true_from_test = sum(1 for r in reason.values() if r == 'test_proof')
+    true_from_test = sum(1 for r in reason.values() if r in ('classic_proof', 'llm_proof'))
+    true_from_classic = sum(1 for r in reason.values() if r == 'classic_proof')
+    true_from_llm = sum(1 for r in reason.values() if r == 'llm_proof')
     true_from_prop = sum(1 for r in reason.values() if r == 'propagate_true')
-    false_from_test = sum(1 for r in reason.values() if r == 'test_counterexample')
+    false_from_test = sum(1 for r in reason.values() if r in ('classic_counterexample', 'llm_counterexample'))
+    false_from_classic = sum(1 for r in reason.values() if r == 'classic_counterexample')
+    false_from_llm = sum(1 for r in reason.values() if r == 'llm_counterexample')
     false_from_prop = sum(1 for r in reason.values() if r == 'propagate_false')
     unknown_count = sum(1 for r in reason.values() if r in ('unparseable', 'unknown'))
 
@@ -229,12 +272,28 @@ def main() -> tuple[dict[str, Any], dict[str, str], dict[str, str], list[str], l
     print(f"  True:  {len(true_eqs) + 1} total  ({true_from_test} by direct proof, {true_from_prop} by True propagation)")
     print(f"  False: {len(false_eqs)} total  ({false_from_test} by counterexample, {false_from_prop} by False propagation)")
     print(f"  UNKNOWN: {unknown_count}")
+    print(
+        "  Direct classic/LLM: "
+        f"True {true_from_classic}/{true_from_llm}, "
+        f"False {false_from_classic}/{false_from_llm}"
+    )
+    if llm_attempts:
+        llm_success = llm_positive + llm_negative
+        print(
+            "  LLM: "
+            f"{llm_success}/{llm_attempts} verified "
+            f"({llm_positive} positive, {llm_negative} negative); "
+            f"tokens={llm_solver.stats['total_tokens']} "
+            f"prompt={llm_solver.stats['prompt_tokens']} "
+            f"completion={llm_solver.stats['completion_tokens']} "
+            f"cost_usd={float(llm_solver.stats['cost_usd']):.6f}"
+        )
     print()
 
     if true_eqs:
         print("True equations (first 30):")
         for eid in true_eqs[:30]:
-            tag = '  test' if reason.get(eid) == 'test_proof' else '  prop'
+            tag = f"  {reason.get(eid, 'prop').replace('_proof', '')}"
             print(f"  {eid}: {eq_string(eid)}  [{tag}]")
         if len(true_eqs) > 30:
             print(f"  ... and {len(true_eqs) - 30} more")
@@ -243,7 +302,7 @@ def main() -> tuple[dict[str, Any], dict[str, str], dict[str, str], list[str], l
     if false_eqs:
         print("False equations (first 30):")
         for eid in false_eqs[:30]:
-            tag = '  test' if reason.get(eid) == 'test_counterexample' else '  prop'
+            tag = f"  {reason.get(eid, 'prop').replace('_counterexample', '')}"
             cex = counterexample.get(eid, '?')
             print(f"  {eid}: {eq_string(eid)}  [{tag}]  cex={cex}")
         if len(false_eqs) > 30:
